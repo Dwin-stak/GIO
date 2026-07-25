@@ -94,3 +94,26 @@ def obtener_google_event_id(recordatorio_id: int, chat_id: int):
     resultado = cursor.fetchone()
     conn.close()
     return resultado[0] if resultado else None
+def obtener_recordatorios_de_hoy():
+    """Trae los recordatorios pendientes de HOY, agrupados por chat_id, para el resumen diario."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    hoy = datetime.now().date().isoformat()
+    cursor.execute("""
+        SELECT chat_id, id, texto, fecha_hora, categoria, prioridad
+        FROM recordatorios
+        WHERE enviado = 0 AND date(fecha_hora) = ?
+        ORDER BY chat_id, fecha_hora
+    """, (hoy,))
+    resultados = cursor.fetchall()
+    conn.close()
+    return resultados
+
+def obtener_chats_unicos():
+    """Devuelve todos los chat_id que alguna vez usaron el bot (para saber a quién mandarle el resumen)."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT chat_id FROM recordatorios")
+    resultados = [fila[0] for fila in cursor.fetchall()]
+    conn.close()
+    return resultados

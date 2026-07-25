@@ -8,6 +8,7 @@ from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 import dateparser
 from google import genai
 from google.genai import types
@@ -32,6 +33,12 @@ EMOJI_PRIORIDAD = {"alta": "🔴", "media": "🟡", "baja": "🟢"}
 
 async def post_init(app):
     scheduler.start()
+    scheduler.add_job(
+        enviar_resumen_diario,
+        CronTrigger(hour=6, minute=0, timezone="America/Bogota"),
+        id="resumen_diario",
+        replace_existing=True
+    )
 
 async def crear_recordatorio(chat_id: int, texto: str, fecha_texto: str, categoria: str = "general", prioridad: str = "media") -> str:
     fecha_texto_limpia = fecha_texto.strip()
@@ -40,7 +47,6 @@ async def crear_recordatorio(chat_id: int, texto: str, fecha_texto: str, categor
             fecha_texto_limpia = fecha_texto_limpia[len(articulo):]
             break
 
-    # Convertir "de la mañana/tarde/noche" a am/pm para evitar ambigüedad con "mañana" (tomorrow)
     fecha_texto_limpia = re.sub(r"\s+de\s+la\s+mañana\b", " am", fecha_texto_limpia, flags=re.IGNORECASE)
     fecha_texto_limpia = re.sub(r"\s+de\s+la\s+tarde\b", " pm", fecha_texto_limpia, flags=re.IGNORECASE)
     fecha_texto_limpia = re.sub(r"\s+de\s+la\s+noche\b", " pm", fecha_texto_limpia, flags=re.IGNORECASE)
@@ -85,6 +91,23 @@ async def enviar_recordatorio(chat_id: int, texto: str, recordatorio_id: int):
     app = Application.builder().token(TOKEN).build()
     await app.bot.send_message(chat_id=chat_id, text=f"🔔 Recordatorio: {texto}")
     db.marcar_enviado(recordatorio_id)
+
+async def enviar_resumen_diario():
+    """Se ejecuta todos los días a las 6am y manda el resumen a cada chat con recordatorios de hoy."""
+    app = Application.builder().token(TOKEN).build()
+    recordatorios_hoy = db.obtener_recordatorios_de_hoy()
+
+    por_chat = {}
+    for chat_id, r_id, texto, fecha_hora, categoria, prioridad in recordatorios_hoy:
+        por_chat.setdefault(chat_id, []).append((r_id, texto, fecha_hora, categoria, prioridad))
+
+    for chat_id, items in por_chat.items():
+        mensaje = "☀️ ¡Buenos días! Esto tenés para hoy:\n\n"
+        for r_id, texto, fecha_hora, categoria, prioridad in items:
+            fecha = datetime.fromisoformat(fecha_hora)
+            emoji = EMOJI_PRIORIDAD.get(prioridad, "🟡")
+            mensaje += f"{emoji} {fecha.strftime('%H:%M')} — {texto} ({categoria})\n"
+        await app.bot.send_message(chat_id=chat_id, text=mensaje)
 
 def listar_recordatorios(chat_id: int) -> str:
     recordatorios = db.obtener_recordatorios(chat_id)
