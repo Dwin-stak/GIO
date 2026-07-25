@@ -1,4 +1,5 @@
 import os
+import json
 import datetime
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -9,7 +10,22 @@ SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 TOKEN_FILE = "token.json"
 CREDENTIALS_FILE = "credentials.json"
 
+def _preparar_archivos_desde_env():
+    """Si estamos en un servidor (Railway), crea los archivos desde variables de entorno."""
+    if not os.path.exists(CREDENTIALS_FILE):
+        contenido = os.getenv("GOOGLE_CREDENTIALS_JSON")
+        if contenido:
+            with open(CREDENTIALS_FILE, "w") as f:
+                f.write(contenido)
+
+    if not os.path.exists(TOKEN_FILE):
+        contenido = os.getenv("GOOGLE_TOKEN_JSON")
+        if contenido:
+            with open(TOKEN_FILE, "w") as f:
+                f.write(contenido)
+
 def obtener_servicio_calendar():
+    _preparar_archivos_desde_env()
     creds = None
 
     if os.path.exists(TOKEN_FILE):
