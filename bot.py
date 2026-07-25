@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import logging
 from datetime import datetime
@@ -38,6 +39,11 @@ async def crear_recordatorio(chat_id: int, texto: str, fecha_texto: str, categor
         if fecha_texto_limpia.startswith(articulo):
             fecha_texto_limpia = fecha_texto_limpia[len(articulo):]
             break
+
+    # Convertir "de la mañana/tarde/noche" a am/pm para evitar ambigüedad con "mañana" (tomorrow)
+    fecha_texto_limpia = re.sub(r"\s+de\s+la\s+mañana\b", " am", fecha_texto_limpia, flags=re.IGNORECASE)
+    fecha_texto_limpia = re.sub(r"\s+de\s+la\s+tarde\b", " pm", fecha_texto_limpia, flags=re.IGNORECASE)
+    fecha_texto_limpia = re.sub(r"\s+de\s+la\s+noche\b", " pm", fecha_texto_limpia, flags=re.IGNORECASE)
 
     fecha_hora = dateparser.parse(
         fecha_texto_limpia,
