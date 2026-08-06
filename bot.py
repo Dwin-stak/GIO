@@ -10,15 +10,16 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import dateparser
-from google import genai
-from google.genai import types
+from groq import Groq
+from tavily import TavilyClient
 
 import database as db
 import calendar_service
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_KEY = os.getenv("GROQ_API_KEY")
+TAVILY_KEY = os.getenv("TAVILY_API_KEY")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -26,8 +27,11 @@ logging.basicConfig(
 )
 
 scheduler = AsyncIOScheduler()
-gemini_client = genai.Client(api_key=GEMINI_KEY)
-MODELO = "gemini-3.1-flash-lite"
+groq_client = Groq(api_key=GROQ_KEY)
+tavily_client = TavilyClient(api_key=TAVILY_KEY)
+
+MODELO_CHAT = "llama-3.3-70b-versatile"
+MODELO_AUDIO = "whisper-large-v3"
 
 EMOJI_PRIORIDAD = {"alta": "🔴", "media": "🟡", "baja": "🟢"}
 
@@ -151,23 +155,46 @@ def eliminar_recordatorio_por_id(chat_id: int, recordatorio_id: int) -> str:
     return "No encontré ese recordatorio."
 
 def buscar_web(consulta: str) -> str:
-    """Busca información actual en la web usando Gemini con Google Search."""
+    """Busca información actual en la web con Tavily y la redacta naturalmente con Groq."""
     try:
-        response = gemini_client.models.generate_content(
-            model=MODELO,
-            contents=(
-                "Respondé en español, de forma natural, cálida, cercana y completa, "
-                "como lo haría una persona bien informada charlando con un amigo (no digas frases robóticas "
-                "como 'según mis fuentes' ni menciones que sos una IA). Dale la información concreta y actualizada. "
-                "Si tiene sentido, cerrá con una pregunta o sugerencia breve y natural relacionada al tema, "
-                "sin forzarlo si no aplica.\n\n"
-                f"Consulta: {consulta}"
-            ),
-            config=types.GenerateContentConfig(
-                tools=[types.Tool(google_search=types.GoogleSearch())]
-            )
+        resultados = tavily_client.search(
+            query=consulta,
+            search_depth="advanced",
+            include_answer=True,
+            max_results=5
         )
-        return response.text.strip()
+
+        respuesta_tavily = resultados.get("answer", "") or ""
+        fragmentos = "\n".join(
+            f"- {r.get('title', '')}: {r.get('content', '')[:400]}"
+            for r in resultados.get("results", [])[:5]
+        )
+
+        contenido_busqueda = f"{respuesta_tavily}\n\n{fragmentos}".strip()
+
+        if not contenido_busqueda:
+            return "No encontré información sobre eso 😕 Probá reformular la pregunta."
+
+        response = groq_client.chat.completions.create(
+            model=MODELO_CHAT,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Respondé en español, de forma natural, cálida, cercana y completa, "
+                        "como lo haría una persona bien informada charlando con un amigo (no digas frases robóticas "
+                        "como 'según mis fuentes' ni menciones que sos una IA). Usá la información que te paso para "
+                        "dar una respuesta concreta y actualizada. Si tiene sentido, cerrá con una pregunta o "
+                        "sugerencia breve y natural relacionada al tema, sin forzarlo si no aplica."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"Consulta: {consulta}\n\nInformación encontrada en la web:\n{contenido_busqueda}"
+                }
+            ]
+        )
+        return response.choices[0].message.content.strip()
     except Exception as e:
         print("⚠️ Error buscando en la web:", e)
         return "No pude buscar esa información justo ahora 😕 Probá de nuevo en un momento."
@@ -216,7 +243,7 @@ async def eliminar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 PROMPT_SISTEMA = """Sos el cerebro de un bot de Telegram, un asistente personal cercano y natural, como un amigo con mucho conocimiento — nunca sonás robótico ni mencionás que sos una IA.
 
-Vas a recibir el HISTORIAL reciente de la conversación (puede estar vacío) y el MENSAJE NUEVO del usuario (texto o audio). Usá el historial para entender si el usuario sigue hablando del mismo tema (ej: "y mañana?" después de preguntar el clima de hoy) o si cambió de tema completamente. Si sigue el mismo tema, completá el contexto que falte.
+Vas a recibir el HISTORIAL reciente de la conversación (puede estar vacío) y el MENSAJE NUEVO del usuario. Usá el historial para entender si el usuario sigue hablando del mismo tema (ej: "y mañana?" después de preguntar el clima de hoy) o si cambió de tema completamente. Si sigue el mismo tema, completá el contexto que falte.
 
 Respondé SOLO con un JSON (sin markdown, sin texto extra, sin explicaciones) con esta estructura exacta:
 
@@ -229,7 +256,7 @@ Respondé SOLO con un JSON (sin markdown, sin texto extra, sin explicaciones) co
   "id": número entero, solo si accion es eliminar,
   "consulta": "string, solo si accion es buscar: la pregunta completa y autocontenida para buscar en la web, resolviendo pronombres o referencias usando el historial si hace falta",
   "respuesta": "string, solo si accion es charla: tu respuesta natural, cálida y completa. Si tiene sentido, cerrá con una pregunta o sugerencia breve relacionada, sin forzarlo",
-  "mensaje_usuario_texto": "string SIEMPRE: transcribí exactamente qué dijo o escribió el usuario (si es audio, la transcripción; si es texto, tal cual)"
+  "mensaje_usuario_texto": "string SIEMPRE: repetí exactamente el mensaje del usuario tal como te llegó"
 }
 
 Usá "buscar" para CUALQUIER cosa que necesite información actual o externa: resultados deportivos, próximos partidos, clima, noticias, precios, quién es alguien actualmente, cuándo es un evento, cualquier dato que pueda haber cambiado o que no sepas con certeza.
@@ -292,23 +319,25 @@ async def ejecutar_accion(datos: dict, chat_id: int) -> str:
     else:
         return "No entendí bien eso, ¿podés reformularlo?"
 
-async def procesar_lenguaje_natural(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mensaje_usuario = update.message.text
-    chat_id = update.effective_chat.id
-
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
+async def manejar_mensaje(update: Update, chat_id: int, mensaje_usuario: str):
+    """Lógica compartida: interpretar el mensaje (ya en texto) con Groq, ejecutar la acción y responder."""
     contexto = obtener_contexto(chat_id)
 
     try:
-        response = gemini_client.models.generate_content(
-            model=MODELO,
-            contents=f"{PROMPT_SISTEMA}\n\nHistorial reciente:\n{contexto}\n\nMensaje nuevo del usuario: \"{mensaje_usuario}\"",
-            config=types.GenerateContentConfig(response_mime_type="application/json")
+        response = groq_client.chat.completions.create(
+            model=MODELO_CHAT,
+            messages=[
+                {"role": "system", "content": PROMPT_SISTEMA},
+                {
+                    "role": "user",
+                    "content": f"Historial reciente:\n{contexto}\n\nMensaje nuevo del usuario: \"{mensaje_usuario}\""
+                }
+            ],
+            response_format={"type": "json_object"}
         )
-        datos = extraer_json(response.text)
+        datos = extraer_json(response.choices[0].message.content)
     except Exception as e:
-        print("⚠️ Error con Gemini:", e)
+        print("⚠️ Error con Groq:", e)
         await update.message.reply_text("Tuve un problema entendiendo eso 😅 Probá de nuevo.")
         return
 
@@ -320,38 +349,37 @@ async def procesar_lenguaje_natural(update: Update, context: ContextTypes.DEFAUL
 
     await update.message.reply_text(resultado)
 
+async def procesar_lenguaje_natural(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    await manejar_mensaje(update, chat_id, update.message.text)
+
 async def procesar_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
-    contexto = obtener_contexto(chat_id)
 
     try:
         voice = update.message.voice
         archivo = await context.bot.get_file(voice.file_id)
         audio_bytes = await archivo.download_as_bytearray()
 
-        response = gemini_client.models.generate_content(
-            model=MODELO,
-            contents=[
-                f"{PROMPT_SISTEMA}\n\nHistorial reciente:\n{contexto}\n\nEl mensaje nuevo del usuario es este audio:",
-                types.Part.from_bytes(data=bytes(audio_bytes), mime_type="audio/ogg"),
-            ],
-            config=types.GenerateContentConfig(response_mime_type="application/json")
+        transcripcion = groq_client.audio.transcriptions.create(
+            file=("audio.ogg", bytes(audio_bytes)),
+            model=MODELO_AUDIO,
+            language="es"
         )
-        datos = extraer_json(response.text)
+        mensaje_usuario = transcripcion.text.strip()
+
+        if not mensaje_usuario:
+            await update.message.reply_text("No pude entender el audio 😅 Probá de nuevo o escribime el mensaje.")
+            return
+
     except Exception as e:
-        print("⚠️ Error procesando audio:", e)
+        print("⚠️ Error transcribiendo audio:", e)
         await update.message.reply_text("No pude entender el audio 😅 Probá de nuevo o escribime el mensaje.")
         return
 
-    resultado = await ejecutar_accion(datos, chat_id)
-
-    texto_usuario_log = datos.get("mensaje_usuario_texto", "(audio)")
-    agregar_historial(chat_id, "Usuario", texto_usuario_log)
-    agregar_historial(chat_id, "Asistente", resultado)
-
-    await update.message.reply_text(resultado)
+    await manejar_mensaje(update, chat_id, mensaje_usuario)
 
 def main():
     db.init_db()
