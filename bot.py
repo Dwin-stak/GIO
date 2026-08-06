@@ -31,6 +31,18 @@ MODELO = "gemini-3.1-flash-lite"
 
 EMOJI_PRIORIDAD = {"alta": "🔴", "media": "🟡", "baja": "🟢"}
 
+# Memoria de conversación en RAM: chat_id -> lista de últimas líneas (usuario/asistente)
+HISTORIAL = {}
+MAX_HISTORIAL = 10  # últimos 5 intercambios (usuario + asistente)
+
+def agregar_historial(chat_id: int, rol: str, texto: str):
+    HISTORIAL.setdefault(chat_id, [])
+    HISTORIAL[chat_id].append(f"{rol}: {texto}")
+    HISTORIAL[chat_id] = HISTORIAL[chat_id][-MAX_HISTORIAL:]
+
+def obtener_contexto(chat_id: int) -> str:
+    return "\n".join(HISTORIAL.get(chat_id, [])) or "(sin conversación previa)"
+
 async def post_init(app):
     scheduler.start()
     scheduler.add_job(
@@ -89,11 +101,11 @@ async def crear_recordatorio(chat_id: int, texto: str, fecha_texto: str, categor
 
 async def enviar_recordatorio(chat_id: int, texto: str, recordatorio_id: int):
     app = Application.builder().token(TOKEN).build()
-    await app.bot.send_message(chat_id=chat_id, text=f"🔔 Recordatorio: {texto}")
+    async with app:
+        await app.bot.send_message(chat_id=chat_id, text=f"🔔 Recordatorio: {texto}")
     db.marcar_enviado(recordatorio_id)
 
 async def enviar_resumen_diario():
-    """Se ejecuta todos los días a las 6am y manda el resumen a cada chat con recordatorios de hoy."""
     app = Application.builder().token(TOKEN).build()
     recordatorios_hoy = db.obtener_recordatorios_de_hoy()
 
@@ -101,13 +113,14 @@ async def enviar_resumen_diario():
     for chat_id, r_id, texto, fecha_hora, categoria, prioridad in recordatorios_hoy:
         por_chat.setdefault(chat_id, []).append((r_id, texto, fecha_hora, categoria, prioridad))
 
-    for chat_id, items in por_chat.items():
-        mensaje = "☀️ ¡Buenos días! Esto tenés para hoy:\n\n"
-        for r_id, texto, fecha_hora, categoria, prioridad in items:
-            fecha = datetime.fromisoformat(fecha_hora)
-            emoji = EMOJI_PRIORIDAD.get(prioridad, "🟡")
-            mensaje += f"{emoji} {fecha.strftime('%H:%M')} — {texto} ({categoria})\n"
-        await app.bot.send_message(chat_id=chat_id, text=mensaje)
+    async with app:
+        for chat_id, items in por_chat.items():
+            mensaje = "☀️ ¡Buenos días! Esto tenés para hoy:\n\n"
+            for r_id, texto, fecha_hora, categoria, prioridad in items:
+                fecha = datetime.fromisoformat(fecha_hora)
+                emoji = EMOJI_PRIORIDAD.get(prioridad, "🟡")
+                mensaje += f"{emoji} {fecha.strftime('%H:%M')} — {texto} ({categoria})\n"
+            await app.bot.send_message(chat_id=chat_id, text=mensaje)
 
 def listar_recordatorios(chat_id: int) -> str:
     recordatorios = db.obtener_recordatorios(chat_id)
@@ -137,13 +150,36 @@ def eliminar_recordatorio_por_id(chat_id: int, recordatorio_id: int) -> str:
         return f"🗑️ Recordatorio #{recordatorio_id} eliminado."
     return "No encontré ese recordatorio."
 
+def buscar_web(consulta: str) -> str:
+    """Busca información actual en la web usando Gemini con Google Search."""
+    try:
+        response = gemini_client.models.generate_content(
+            model=MODELO,
+            contents=(
+                "Respondé en español, de forma natural, cálida, cercana y completa, "
+                "como lo haría una persona bien informada charlando con un amigo (no digas frases robóticas "
+                "como 'según mis fuentes' ni menciones que sos una IA). Dale la información concreta y actualizada. "
+                "Si tiene sentido, cerrá con una pregunta o sugerencia breve y natural relacionada al tema, "
+                "sin forzarlo si no aplica.\n\n"
+                f"Consulta: {consulta}"
+            ),
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())]
+            )
+        )
+        return response.text.strip()
+    except Exception as e:
+        print("⚠️ Error buscando en la web:", e)
+        return "No pude buscar esa información justo ahora 😕 Probá de nuevo en un momento."
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "¡Hola! 👋 Soy tu asistente personal.\n\n"
         "Podés escribirme o mandarme un audio, como si le hablaras a una persona. Ej:\n"
         "• \"recordame comprar pan mañana a las 9am, es urgente\"\n"
         "• \"qué recordatorios tengo\"\n"
-        "• \"eliminá el recordatorio 2\"\n\n"
+        "• \"cuál es el próximo partido del Junior\"\n"
+        "• \"cómo está el clima hoy\"\n\n"
         "O usar comandos:\n"
         "📌 /recordar [texto] el [fecha/hora]\n"
         "📋 /misrecordatorios\n"
@@ -178,38 +214,47 @@ async def eliminar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         eliminar_recordatorio_por_id(update.effective_chat.id, recordatorio_id)
     )
 
-PROMPT_SISTEMA = """Sos el cerebro de un bot de Telegram asistente personal. Vas a recibir un mensaje (texto o audio hablado) del usuario. Analizalo y respondé SOLO con un JSON (sin markdown, sin texto extra, sin explicaciones) con esta estructura exacta:
+PROMPT_SISTEMA = """Sos el cerebro de un bot de Telegram, un asistente personal cercano y natural, como un amigo con mucho conocimiento — nunca sonás robótico ni mencionás que sos una IA.
+
+Vas a recibir el HISTORIAL reciente de la conversación (puede estar vacío) y el MENSAJE NUEVO del usuario (texto o audio). Usá el historial para entender si el usuario sigue hablando del mismo tema (ej: "y mañana?" después de preguntar el clima de hoy) o si cambió de tema completamente. Si sigue el mismo tema, completá el contexto que falte.
+
+Respondé SOLO con un JSON (sin markdown, sin texto extra, sin explicaciones) con esta estructura exacta:
 
 {
-  "accion": "crear_recordatorio" | "listar" | "eliminar" | "charla",
+  "accion": "crear_recordatorio" | "listar" | "eliminar" | "buscar" | "charla",
   "texto": "string, solo si accion es crear_recordatorio: qué hay que recordar",
-  "fecha_texto": "string, solo si accion es crear_recordatorio: la fecha/hora en texto natural tal cual la dijo el usuario",
-  "categoria": "string, solo si accion es crear_recordatorio: una palabra corta como 'trabajo', 'personal', 'salud', 'estudio', 'general', la que mejor aplique según el contexto",
-  "prioridad": "'alta' | 'media' | 'baja', solo si accion es crear_recordatorio: inferí la urgencia según palabras como 'urgente', 'importante', 'cuando pueda', o el tipo de tarea. Si no hay pistas, usá 'media'",
+  "fecha_texto": "string, solo si accion es crear_recordatorio: la fecha/hora tal cual la dijo el usuario",
+  "categoria": "string, solo si accion es crear_recordatorio: 'trabajo', 'personal', 'salud', 'estudio', 'general', etc.",
+  "prioridad": "'alta' | 'media' | 'baja', solo si accion es crear_recordatorio",
   "id": número entero, solo si accion es eliminar,
-  "respuesta": "string, solo si accion es charla: tu respuesta natural y breve"
+  "consulta": "string, solo si accion es buscar: la pregunta completa y autocontenida para buscar en la web, resolviendo pronombres o referencias usando el historial si hace falta",
+  "respuesta": "string, solo si accion es charla: tu respuesta natural, cálida y completa. Si tiene sentido, cerrá con una pregunta o sugerencia breve relacionada, sin forzarlo",
+  "mensaje_usuario_texto": "string SIEMPRE: transcribí exactamente qué dijo o escribió el usuario (si es audio, la transcripción; si es texto, tal cual)"
 }
+
+Usá "buscar" para CUALQUIER cosa que necesite información actual o externa: resultados deportivos, próximos partidos, clima, noticias, precios, quién es alguien actualmente, cuándo es un evento, cualquier dato que pueda haber cambiado o que no sepas con certeza.
+
+Usá "charla" solo para saludos, charla casual, opiniones, o preguntas de conocimiento general estable que no requieran datos actuales.
 
 Ejemplos:
 Usuario: "recordame comprar pan mañana a las 9am"
-{"accion": "crear_recordatorio", "texto": "comprar pan", "fecha_texto": "mañana a las 9am", "categoria": "personal", "prioridad": "media"}
+{"accion": "crear_recordatorio", "texto": "comprar pan", "fecha_texto": "mañana a las 9am", "categoria": "personal", "prioridad": "media", "mensaje_usuario_texto": "recordame comprar pan mañana a las 9am"}
 
-Usuario: "urgente, recordame pagar el arriendo el viernes, es importante"
-{"accion": "crear_recordatorio", "texto": "pagar el arriendo", "fecha_texto": "el viernes", "categoria": "personal", "prioridad": "alta"}
+Usuario: "cual es el proximo partido del Junior"
+{"accion": "buscar", "consulta": "próximo partido del Junior de Barranquilla, fecha y hora", "mensaje_usuario_texto": "cual es el proximo partido del Junior"}
 
-Usuario: "recordame la reunión con el equipo mañana a las 10am"
-{"accion": "crear_recordatorio", "texto": "reunión con el equipo", "fecha_texto": "mañana a las 10am", "categoria": "trabajo", "prioridad": "media"}
+Historial: "Usuario: cual es el proximo partido del Junior\\nAsistente: [resumen del partido]"
+Usuario: "y contra quien es el siguiente"
+{"accion": "buscar", "consulta": "partido del Junior de Barranquilla después del próximo, rival y fecha", "mensaje_usuario_texto": "y contra quien es el siguiente"}
 
 Usuario: "qué recordatorios tengo"
-{"accion": "listar"}
+{"accion": "listar", "mensaje_usuario_texto": "qué recordatorios tengo"}
 
 Usuario: "eliminá el recordatorio 2"
-{"accion": "eliminar", "id": 2}
+{"accion": "eliminar", "id": 2, "mensaje_usuario_texto": "eliminá el recordatorio 2"}
 
 Usuario: "hola como estas"
-{"accion": "charla", "respuesta": "¡Todo bien! ¿En qué te ayudo hoy?"}
-
-Si el mensaje es un audio, primero entendé qué dijo la persona y después aplicá la misma lógica de arriba.
+{"accion": "charla", "respuesta": "¡Todo bien por acá! ¿Cómo va tu día?", "mensaje_usuario_texto": "hola como estas"}
 
 Respondé ÚNICAMENTE con el objeto JSON, nada más."""
 
@@ -237,6 +282,11 @@ async def ejecutar_accion(datos: dict, chat_id: int) -> str:
         if rid is None:
             return "¿Cuál recordatorio querés eliminar? Decime el número."
         return eliminar_recordatorio_por_id(chat_id, int(rid))
+    elif accion == "buscar":
+        consulta = datos.get("consulta") or datos.get("mensaje_usuario_texto") or ""
+        if not consulta:
+            return "¿Qué querés que busque?"
+        return buscar_web(consulta)
     elif accion == "charla":
         return datos.get("respuesta", "¿En qué te ayudo?")
     else:
@@ -248,10 +298,12 @@ async def procesar_lenguaje_natural(update: Update, context: ContextTypes.DEFAUL
 
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
+    contexto = obtener_contexto(chat_id)
+
     try:
         response = gemini_client.models.generate_content(
             model=MODELO,
-            contents=f"{PROMPT_SISTEMA}\n\nUsuario: \"{mensaje_usuario}\"",
+            contents=f"{PROMPT_SISTEMA}\n\nHistorial reciente:\n{contexto}\n\nMensaje nuevo del usuario: \"{mensaje_usuario}\"",
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
         datos = extraer_json(response.text)
@@ -260,11 +312,19 @@ async def procesar_lenguaje_natural(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text("Tuve un problema entendiendo eso 😅 Probá de nuevo.")
         return
 
-    await update.message.reply_text(await ejecutar_accion(datos, chat_id))
+    resultado = await ejecutar_accion(datos, chat_id)
+
+    texto_usuario_log = datos.get("mensaje_usuario_texto", mensaje_usuario)
+    agregar_historial(chat_id, "Usuario", texto_usuario_log)
+    agregar_historial(chat_id, "Asistente", resultado)
+
+    await update.message.reply_text(resultado)
 
 async def procesar_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+    contexto = obtener_contexto(chat_id)
 
     try:
         voice = update.message.voice
@@ -274,7 +334,7 @@ async def procesar_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = gemini_client.models.generate_content(
             model=MODELO,
             contents=[
-                PROMPT_SISTEMA,
+                f"{PROMPT_SISTEMA}\n\nHistorial reciente:\n{contexto}\n\nEl mensaje nuevo del usuario es este audio:",
                 types.Part.from_bytes(data=bytes(audio_bytes), mime_type="audio/ogg"),
             ],
             config=types.GenerateContentConfig(response_mime_type="application/json")
@@ -285,7 +345,13 @@ async def procesar_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No pude entender el audio 😅 Probá de nuevo o escribime el mensaje.")
         return
 
-    await update.message.reply_text(await ejecutar_accion(datos, chat_id))
+    resultado = await ejecutar_accion(datos, chat_id)
+
+    texto_usuario_log = datos.get("mensaje_usuario_texto", "(audio)")
+    agregar_historial(chat_id, "Usuario", texto_usuario_log)
+    agregar_historial(chat_id, "Asistente", resultado)
+
+    await update.message.reply_text(resultado)
 
 def main():
     db.init_db()
