@@ -5,3 +5,5 @@ token.json
 asistente.db
 __pycache__/
 *.pyc
+cloudflared.exe
+*.log
